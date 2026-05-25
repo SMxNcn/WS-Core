@@ -2,24 +2,28 @@ package top.nckim.ws
 
 import com.google.gson.Gson
 import com.google.gson.JsonObject
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
+import org.java_websocket.client.WebSocketClient
+import org.java_websocket.handshake.ServerHandshake
 import top.nckim.utils.Base64Utils
+import java.net.InetAddress
+import java.net.Socket
+import java.net.URI
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLParameters
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.pow
 
@@ -36,18 +40,14 @@ class WsClient(
     private val reconnectAttempt = AtomicInteger(0)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS)
-        .pingInterval(config.heartbeatIntervalMs, TimeUnit.MILLISECONDS)
-        .apply { if (customHostnameVerifier != null) hostnameVerifier(customHostnameVerifier) }
-        .build()
-
     @Volatile
-    private var webSocket: WebSocket? = null
+    private var webSocket: WebSocketClient? = null
 
     @Volatile
     private var reconnectJob: Job? = null
+
+    @Volatile
+    private var heartbeatJob: Job? = null
 
     companion object {
         const val SERVER_URL = "wss://nckim.top/ws"
@@ -83,8 +83,9 @@ class WsClient(
         connectionState.set(WsConnectionState.CONNECTING)
         fireEvent { onConnectionStateChanged(WsConnectionState.CONNECTING) }
 
-        val request = Request.Builder().url(serverUrl).build()
-        webSocket = okHttpClient.newWebSocket(request, wsListener())
+        val client = createWebSocket()
+        webSocket = client
+        client.connect()
     }
 
     fun disconnect() {
@@ -97,10 +98,10 @@ class WsClient(
     fun shutdown() {
         intentionalDisconnect.set(true)
         reconnectJob?.cancel()
+        heartbeatJob?.cancel()
         webSocket?.close(1000, "Client shutdown")
         webSocket = null
         scope.cancel()
-        okHttpClient.dispatcher.executorService.shutdown()
     }
 
     fun sendChat(content: String) {
@@ -121,41 +122,114 @@ class WsClient(
         sendEnvelope(TYPE_PING)
     }
 
-    private fun wsListener() = object : WebSocketListener() {
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            reconnectAttempt.set(0)
-            connectionState.set(WsConnectionState.CONNECTED)
-            fireEvent { onConnectionStateChanged(WsConnectionState.CONNECTED) }
+    private fun createWebSocket(): WebSocketClient {
+        val uri = URI(serverUrl)
+        val client = object : WebSocketClient(uri) {
+            override fun onOpen(handshake: ServerHandshake) {
+                reconnectAttempt.set(0)
+                connectionState.set(WsConnectionState.CONNECTED)
+                fireEvent { onConnectionStateChanged(WsConnectionState.CONNECTED) }
 
-            val payload = JsonObject().apply {
-                addProperty("ign", config.playerIgn)
-                addProperty("island", config.island)
+                val payload = JsonObject().apply {
+                    addProperty("ign", config.playerIgn)
+                    addProperty("island", config.island)
+                }
+                sendEnvelope(TYPE_CONNECT, payload)
+                startHeartbeat()
             }
-            sendEnvelope(TYPE_CONNECT, payload)
-        }
 
-        override fun onMessage(webSocket: WebSocket, text: String) {
-            val envelope = parseEnvelope(text) ?: return
-            handleMessage(envelope)
-        }
+            override fun onMessage(message: String) {
+                val envelope = parseEnvelope(message) ?: return
+                handleMessage(envelope)
+            }
 
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            this@WsClient.webSocket = null
-            connectionState.set(WsConnectionState.DISCONNECTED)
-            fireEvent { onDisconnected() }
-            fireEvent { onConnectionStateChanged(WsConnectionState.DISCONNECTED) }
+            override fun onClose(code: Int, reason: String?, remote: Boolean) {
+                stopHeartbeat()
+                this@WsClient.webSocket = null
+                connectionState.set(WsConnectionState.DISCONNECTED)
+                fireEvent { onDisconnected() }
+                fireEvent { onConnectionStateChanged(WsConnectionState.DISCONNECTED) }
 
-            if (!intentionalDisconnect.get()) {
-                scheduleReconnect()
+                if (!intentionalDisconnect.get()) {
+                    scheduleReconnect()
+                }
+            }
+
+            override fun onError(ex: Exception) {
+                if (!intentionalDisconnect.get()) {
+                    fireEvent { onErrorReceived("CONNECTION_ERROR", ex.message ?: "Unknown error") }
+                }
             }
         }
 
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            this@WsClient.webSocket = null
-            if (!intentionalDisconnect.get()) {
-                fireEvent { onErrorReceived("CONNECTION_ERROR", t.message ?: "Unknown error") }
+        client.setConnectionLostTimeout(0)
+
+        if (customHostnameVerifier != null && serverUrl.startsWith("wss://")) {
+            try {
+                val sslContext = SSLContext.getInstance("TLS")
+                sslContext.init(null, null, null)
+                val delegate = sslContext.socketFactory
+                client.setSocketFactory(object : SSLSocketFactory() {
+                    override fun createSocket(s: Socket, host: String?, port: Int, autoClose: Boolean): Socket {
+                        val socket = delegate.createSocket(s, host, port, autoClose) as SSLSocket
+                        socket.setSSLParameters(SSLParameters().apply { endpointIdentificationAlgorithm = null })
+                        return socket
+                    }
+
+                    override fun createSocket(host: String?, port: Int): Socket {
+                        val socket = delegate.createSocket(host, port) as SSLSocket
+                        socket.setSSLParameters(SSLParameters().apply { endpointIdentificationAlgorithm = null })
+                        return socket
+                    }
+
+                    override fun createSocket(host: String?, port: Int, localHost: InetAddress?, localPort: Int): Socket {
+                        val socket = delegate.createSocket(host, port, localHost, localPort) as SSLSocket
+                        socket.setSSLParameters(SSLParameters().apply { endpointIdentificationAlgorithm = null })
+                        return socket
+                    }
+
+                    override fun createSocket(host: InetAddress?, port: Int): Socket {
+                        val socket = delegate.createSocket(host, port) as SSLSocket
+                        socket.setSSLParameters(SSLParameters().apply { endpointIdentificationAlgorithm = null })
+                        return socket
+                    }
+
+                    override fun createSocket(host: InetAddress?, port: Int, localAddress: InetAddress?, localPort: Int): Socket {
+                        val socket = delegate.createSocket(host, port, localAddress, localPort) as SSLSocket
+                        socket.setSSLParameters(SSLParameters().apply { endpointIdentificationAlgorithm = null })
+                        return socket
+                    }
+
+                    override fun createSocket(): Socket {
+                        val socket = delegate.createSocket() as SSLSocket
+                        socket.setSSLParameters(SSLParameters().apply { endpointIdentificationAlgorithm = null })
+                        return socket
+                    }
+
+                    override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
+                    override fun getSupportedCipherSuites(): Array<String> = delegate.supportedCipherSuites
+                })
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
+
+        return client
+    }
+
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                delay(config.heartbeatIntervalMs)
+                sendPingMessage()
+            }
+        }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
     }
 
     private fun handleMessage(envelope: MessageEnvelope) {
@@ -212,6 +286,7 @@ class WsClient(
 
     private fun sendEnvelope(type: String, payload: JsonObject? = null) {
         val ws = webSocket ?: return
+        if (!ws.isOpen) return
         val obj = JsonObject().apply {
             addProperty("type", type)
             addProperty("source", config.source)
@@ -257,8 +332,9 @@ class WsClient(
                 connectionState.set(WsConnectionState.CONNECTING)
                 fireEvent { onConnectionStateChanged(WsConnectionState.CONNECTING) }
 
-                val request = Request.Builder().url(serverUrl).build()
-                webSocket = okHttpClient.newWebSocket(request, wsListener())
+                val client = createWebSocket()
+                webSocket = client
+                client.connect()
             } finally {
                 reconnectJob = null
             }

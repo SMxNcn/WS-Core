@@ -10,7 +10,9 @@ repositories {
 }
 
 dependencies {
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.java-websocket:Java-WebSocket:1.5.6") {
+        exclude("org.slf4j", "slf4j-api")
+    }
 
     compileOnly("com.google.code.gson:gson:2.11.0")
     compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
@@ -20,7 +22,8 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.0")
     testImplementation("com.google.code.gson:gson:2.11.0")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-    testImplementation("org.java-websocket:Java-WebSocket:1.5.6")
+    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.16")
+    testImplementation(kotlin("test"))
 }
 
 java {
@@ -37,8 +40,7 @@ tasks.test {
 }
 
 tasks.jar {
-    from(configurations.runtimeClasspath.get().filter {
-        it.name.contains("okhttp") || it.name.contains("okio")
-    }.map { zipTree(it) })
+    val runtimeClasspath = configurations["runtimeClasspath"]
+    from(provider { runtimeClasspath.files.map { zipTree(it) } })
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }

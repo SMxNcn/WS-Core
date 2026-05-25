@@ -1,6 +1,6 @@
 # WS-Core
 
-A standalone Kotlin/JVM WebSocket client library for Minecraft Mods. Built with OkHttp.
+A standalone Kotlin/JVM WebSocket client library for Minecraft Mods. Built with Java-WebSocket.
 
 ## Build
 
